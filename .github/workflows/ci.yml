@@ -1,0 +1,22 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make build CFLAGS="-O3 -march=native -fopenmp -Wall -Wextra -std=c11"
+      - name: Verify O(h^2) convergence and OpenMP equivalence
+        run: make test
+      - name: Quick solver breakdown run
+        run: |
+          mkdir -p results
+          ./build/fem_solver -n 128 -r 1 --csv | tee results/fem.csv
+          python3 scripts/plot_svg.py results/fem.csv results/fem.csv results/fem_breakdown.svg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fem-results
+          path: results/
