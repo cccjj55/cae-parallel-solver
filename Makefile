@@ -24,3 +24,19 @@ bench: build
 
 clean:
 	rm -rf build results
+
+# GPU path is optional: needs nvcc and a CUDA-capable device.
+NVCC ?= nvcc
+CUDA_ARCH ?= sm_120
+HOSTCXX ?= g++
+
+cuda:
+	@mkdir -p build
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -ccbin $(HOSTCXX) src/spmv_cuda.cu -o build/spmv_cuda
+
+# Same matrix on both sides: export the CPU-assembled CSR, then feed it to the kernels.
+gpu-bench: build cuda
+	./build/fem_solver -n 400 --export build/m400.csr
+	./build/fem_solver -n 800 --export build/m800.csr
+	./build/spmv_cuda build/m400.csr 30
+	./build/spmv_cuda build/m800.csr 30

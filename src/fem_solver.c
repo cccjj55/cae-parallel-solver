@@ -499,11 +499,13 @@ int main(int argc, char** argv) {
     int nx = 400;
     int reps = 3;
     int csv = 0;
+    const char* export_path = NULL;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--test") == 0) return run_tests();
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) nx = atoi(argv[++i]);
         if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) reps = atoi(argv[++i]);
         if (strcmp(argv[i], "--csv") == 0) csv = 1;
+        if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) export_path = argv[++i];
     }
 
     Mesh mesh;
@@ -517,6 +519,22 @@ int main(int argc, char** argv) {
 
     const int max_threads = omp_get_max_threads();
     const double bytes_per_spmv = 12.0 * (double)mat.nnz + 16.0 * (double)mat.n_dof;
+
+    if (export_path) {
+        assemble_serial(nx, &mesh, node_x, node_y, &mat, rhs);
+        FILE* f = fopen(export_path, "wb");
+        if (!f) { perror("export"); return 3; }
+        fwrite("CSR1", 1, 4, f);
+        fwrite(&mat.n_dof, sizeof(int), 1, f);
+        fwrite(&mat.nnz, sizeof(int), 1, f);
+        fwrite(mat.row_ptr, sizeof(int), (size_t)mat.n_dof + 1, f);
+        fwrite(mat.col_idx, sizeof(int), (size_t)mat.nnz, f);
+        fwrite(mat.val, sizeof(double), (size_t)mat.nnz, f);
+        fwrite(rhs, sizeof(double), (size_t)mat.n_dof, f);
+        fclose(f);
+        printf("exported %s: n_dof=%d nnz=%d\n", export_path, mat.n_dof, mat.nnz);
+        return 0;
+    }
 
     if (csv) {
         printf("mode,threads,nx,dof,nnz,iters,total_s,asm_s,spmv_s,vec_s,spmv_gbps,l2_err\n");
