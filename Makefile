@@ -40,3 +40,13 @@ gpu-bench: build cuda
 	./build/fem_solver -n 800 --export build/m800.csr
 	./build/spmv_cuda build/m400.csr 30
 	./build/spmv_cuda build/m800.csr 30
+
+cg-cuda:
+	@mkdir -p build
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -ccbin $(HOSTCXX) src/cg_cuda.cu -o build/cg_cuda
+
+cg-both: build cg-cuda
+	./build/fem_solver -n 400 --export build/m400.csr
+	./build/fem_solver -n 800 --export build/m800.csr
+	./build/cg_cuda build/m400.csr 5000 1e-10
+	./build/cg_cuda build/m800.csr 5000 1e-10
