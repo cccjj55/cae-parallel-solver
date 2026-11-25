@@ -46,6 +46,54 @@ Effective CSR SpMV bandwidth uses compulsory traffic `(12·nnz + 16·dof)` bytes
 | `omp_atomic` | 12 | 1.475 | 3.21× | 20.05 | 1.148 | 0.306 | 61.0 GB/s |
 | `omp_colored` | 12 | **1.452** | **3.26×** | **15.92 (4.18×)** | **1.132** | **0.303** | **61.9 GB/s** |
 
+## GPU: same matrix, different schedule
+
+`fem_solver -n <nx> --export build/m<nx>.csr` writes the assembled CSR, and `src/cg_cuda_dev.cu` solves the
+same system on the GPU. Two GPU versions exist because the first one had a lesson in it.
+
+| case | iters | CPU 12 threads | GPU v1: host syncs | GPU v2: device loop | v2 vs CPU |
+| --- | --- | --- | --- | --- | --- |
+| nx=400, 159k DOF | 571 / 580 | 65 ms | 147 ms (**0.44×**) | **56 ms** | **1.15×** |
+| nx=800, 638k DOF | 1098 / 1100 | 962 ms | 465 ms (2.07×) | **331 ms** | **2.91×** |
+
+Both GPU versions converge to the same solution as the CPU run (`sum(x) = 64844.557535290` at 159k,
+`259381.230124981` at 638k; relative residual 7.5e-11 and 2.2e-10).
+
+- **v1** synchronised with the host three times per iteration: three dot products, each a device→host copy.
+  At 159k DOF one SpMV is only 19 µs, so those round trips were ~93% of the iteration — the GPU lost to a
+  12-thread CPU.
+- **v2** keeps the reductions and the scalars `alpha` / `beta` on the device. The two dots needed per
+  iteration are reduced in place, `alpha` and `beta` come from a one-thread kernel, and the `axpy` / `axpby`
+  kernels read their scalar from device memory. The only host read left is the residual check.
+- **The maths never changed.** Same matrix, same tolerance, same iteration count. The schedule changed, and
+  the small case went from 0.44× to 1.15×.
+
+**How often to check convergence** (159k DOF, tolerance 1e-10):
+
+| residual check every | iterations | solve time | ms/iter |
+| --- | --- | --- | --- |
+| 1 | 571 | 77 ms | 0.136 |
+| 5 | 575 | 61 ms | 0.106 |
+| **20** | 580 | **56 ms** | **0.097** |
+| 50 | 600 | 65 ms | 0.109 |
+| 100 | 600 | 58 ms | 0.097 |
+
+Checking every iteration costs 37% more than every 20; checking every 50 overshoots to 600 iterations.
+The sweet spot is a property of the machine and the matrix, which is why it is a flag (`sync_every`).
+
+**Burst is not sustained.** The same SpMV kernel, same matrix, measured at three repetition counts:
+
+| repetitions | ms per SpMV | GB/s |
+| --- | --- | --- |
+| 30 | 0.162 | 392.9 |
+| 1,098 | 0.180 | 354.4 |
+| 3,000 | 0.331 | **192.8** |
+
+A laptop GPU does not hold its burst bandwidth. Every number in this README states its run length for that
+reason.
+
+Reproduce: `make gpu-bench` (kernels) and `make cg-both` (both CG versions).
+
 ## Three takeaways for CAE performance engineering
 
 1. **Why optimize SpMV before assembly:** On `nx=800` at 12 threads, CSR assembly takes **1.1%**
