@@ -43,12 +43,20 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+static inline double diffusivity(double x, int graded) {
+    return graded ? (1.0 + 49.0 * x * x) : 1.0;
+}
+
 static inline double exact_u(double x, double y) {
     return sin(M_PI * x) * sin(M_PI * y);
 }
 
-static inline double rhs_f(double x, double y) {
-    return 2.0 * M_PI * M_PI * sin(M_PI * x) * sin(M_PI * y);
+static inline double rhs_f(double x, double y, int graded) {
+    const double k = diffusivity(x, graded);
+    const double base = 2.0 * M_PI * M_PI * k * sin(M_PI * x) * sin(M_PI * y);
+    if (!graded) return base;
+    const double dk_dx = 98.0 * x;
+    return base - dk_dx * M_PI * cos(M_PI * x) * sin(M_PI * y);
 }
 
 static int interior_id(int ix, int iy, int nx) {
@@ -160,13 +168,15 @@ static inline int find_csr_slot(const CSRMatrix* mat, int row, int col) {
 
 static inline void elem_stiffness(
     const int tri[3], const double* nx_coord, const double* ny_coord,
-    double ke[3][3], double fe[3]) {
+    int graded, double ke[3][3], double fe[3]) {
     const double x0 = nx_coord[tri[0]], y0 = ny_coord[tri[0]];
     const double x1 = nx_coord[tri[1]], y1 = ny_coord[tri[1]];
     const double x2 = nx_coord[tri[2]], y2 = ny_coord[tri[2]];
 
     const double twice_area = fabs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0));
-    const double inv_4a = 1.0 / (2.0 * twice_area);
+    const double xc = (x0 + x1 + x2) / 3.0;
+    const double k_elem = diffusivity(xc, graded);
+    const double inv_4a = k_elem / (2.0 * twice_area);
 
     const double b[3] = {y1 - y2, y2 - y0, y0 - y1};
     const double c[3] = {x2 - x1, x0 - x2, x1 - x0};
@@ -176,9 +186,9 @@ static inline void elem_stiffness(
         }
     }
 
-    const double f01 = rhs_f(0.5 * (x0 + x1), 0.5 * (y0 + y1));
-    const double f12 = rhs_f(0.5 * (x1 + x2), 0.5 * (y1 + y2));
-    const double f20 = rhs_f(0.5 * (x2 + x0), 0.5 * (y2 + y0));
+    const double f01 = rhs_f(0.5 * (x0 + x1), 0.5 * (y0 + y1), graded);
+    const double f12 = rhs_f(0.5 * (x1 + x2), 0.5 * (y1 + y2), graded);
+    const double f20 = rhs_f(0.5 * (x2 + x0), 0.5 * (y2 + y0), graded);
     const double w = (0.5 * twice_area) / 6.0;
     fe[0] = w * (f01 + f20);
     fe[1] = w * (f01 + f12);
@@ -192,13 +202,13 @@ static inline int global_to_dof(int node, int nx) {
 
 static void assemble_serial(
     int nx, const Mesh* mesh, const double* node_x, const double* node_y,
-    CSRMatrix* mat, double* rhs) {
+    int graded, CSRMatrix* mat, double* rhs) {
     memset(mat->val, 0, (size_t)mat->nnz * sizeof(double));
     memset(rhs, 0, (size_t)mat->n_dof * sizeof(double));
 
     for (int e = 0; e < mesh->n_elem; ++e) {
         double ke[3][3], fe[3];
-        elem_stiffness(mesh->conn[e], node_x, node_y, ke, fe);
+        elem_stiffness(mesh->conn[e], node_x, node_y, graded, ke, fe);
         int dofs[3];
         for (int a = 0; a < 3; ++a) dofs[a] = global_to_dof(mesh->conn[e][a], nx);
 
@@ -216,7 +226,7 @@ static void assemble_serial(
 
 static void assemble_omp_atomic(
     int nx, const Mesh* mesh, const double* node_x, const double* node_y,
-    CSRMatrix* mat, double* rhs) {
+    int graded, CSRMatrix* mat, double* rhs) {
     #pragma omp parallel for schedule(static)
     for (int k = 0; k < mat->nnz; ++k) mat->val[k] = 0.0;
     #pragma omp parallel for schedule(static)
@@ -225,7 +235,7 @@ static void assemble_omp_atomic(
     #pragma omp parallel for schedule(static)
     for (int e = 0; e < mesh->n_elem; ++e) {
         double ke[3][3], fe[3];
-        elem_stiffness(mesh->conn[e], node_x, node_y, ke, fe);
+        elem_stiffness(mesh->conn[e], node_x, node_y, graded, ke, fe);
         int dofs[3];
         for (int a = 0; a < 3; ++a) dofs[a] = global_to_dof(mesh->conn[e][a], nx);
 
@@ -245,7 +255,7 @@ static void assemble_omp_atomic(
 
 static void assemble_omp_colored(
     int nx, const Mesh* mesh, const double* node_x, const double* node_y,
-    CSRMatrix* mat, double* rhs) {
+    int graded, CSRMatrix* mat, double* rhs) {
     #pragma omp parallel for schedule(static)
     for (int k = 0; k < mat->nnz; ++k) mat->val[k] = 0.0;
     #pragma omp parallel for schedule(static)
@@ -258,7 +268,7 @@ static void assemble_omp_colored(
         for (int idx = begin; idx < end; ++idx) {
             const int e = mesh->color_elems[idx];
             double ke[3][3], fe[3];
-            elem_stiffness(mesh->conn[e], node_x, node_y, ke, fe);
+            elem_stiffness(mesh->conn[e], node_x, node_y, graded, ke, fe);
             int dofs[3];
             for (int a = 0; a < 3; ++a) dofs[a] = global_to_dof(mesh->conn[e][a], nx);
 
@@ -277,37 +287,59 @@ static void assemble_omp_colored(
 
 static int cg_solve(
     const CSRMatrix* mat, const double* rhs, double* u,
-    int use_omp, int max_iter, double tol,
+    int use_omp, int use_jacobi, int max_iter, double tol,
     double* spmv_time_out, double* vec_time_out) {
     const int n = mat->n_dof;
     double* r = (double*)malloc((size_t)n * sizeof(double));
+    double* z = (double*)malloc((size_t)n * sizeof(double));
     double* p = (double*)malloc((size_t)n * sizeof(double));
     double* Ap = (double*)malloc((size_t)n * sizeof(double));
+    double* inv_diag = (double*)malloc((size_t)n * sizeof(double));
 
+    double bnorm2 = 0.0;
     double rzold = 0.0;
     if (use_omp) {
-        #pragma omp parallel for schedule(static) reduction(+:rzold)
+        #pragma omp parallel for schedule(static) reduction(+:bnorm2,rzold)
         for (int i = 0; i < n; ++i) {
+            double diag = 1.0;
+            if (use_jacobi) {
+                for (int k = mat->row_ptr[i]; k < mat->row_ptr[i + 1]; ++k) {
+                    if (mat->col_idx[k] == i) { diag = mat->val[k]; break; }
+                }
+            }
+            inv_diag[i] = 1.0 / diag;
             u[i] = 0.0;
             r[i] = rhs[i];
-            p[i] = rhs[i];
-            rzold += r[i] * r[i];
+            z[i] = use_jacobi ? (r[i] * inv_diag[i]) : r[i];
+            p[i] = z[i];
+            bnorm2 += r[i] * r[i];
+            rzold += r[i] * z[i];
         }
     } else {
         for (int i = 0; i < n; ++i) {
+            double diag = 1.0;
+            if (use_jacobi) {
+                for (int k = mat->row_ptr[i]; k < mat->row_ptr[i + 1]; ++k) {
+                    if (mat->col_idx[k] == i) { diag = mat->val[k]; break; }
+                }
+            }
+            inv_diag[i] = 1.0 / diag;
             u[i] = 0.0;
             r[i] = rhs[i];
-            p[i] = rhs[i];
-            rzold += r[i] * r[i];
+            z[i] = use_jacobi ? (r[i] * inv_diag[i]) : r[i];
+            p[i] = z[i];
+            bnorm2 += r[i] * r[i];
+            rzold += r[i] * z[i];
         }
     }
 
-    const double tol2 = tol * tol * rzold;
+    const double tol2 = tol * tol * bnorm2;
+    double r_norm2 = bnorm2;
     double spmv_t = 0.0, vec_t = 0.0;
     int iter = 0;
 
     for (iter = 0; iter < max_iter; ++iter) {
-        if (rzold <= tol2) break;
+        if (r_norm2 <= tol2) break;
 
         const double t0 = now_sec();
         if (use_omp) {
@@ -341,34 +373,44 @@ static int cg_solve(
         const double alpha = rzold / pAp;
 
         double rznew = 0.0;
+        double rnorm2_new = 0.0;
         if (use_omp) {
-            #pragma omp parallel for schedule(static) reduction(+:rznew)
+            #pragma omp parallel for schedule(static) reduction(+:rznew,rnorm2_new)
             for (int i = 0; i < n; ++i) {
                 u[i] += alpha * p[i];
                 r[i] -= alpha * Ap[i];
-                rznew += r[i] * r[i];
+                const double zi = use_jacobi ? (r[i] * inv_diag[i]) : r[i];
+                z[i] = zi;
+                rznew += r[i] * zi;
+                rnorm2_new += r[i] * r[i];
             }
         } else {
             for (int i = 0; i < n; ++i) {
                 u[i] += alpha * p[i];
                 r[i] -= alpha * Ap[i];
-                rznew += r[i] * r[i];
+                const double zi = use_jacobi ? (r[i] * inv_diag[i]) : r[i];
+                z[i] = zi;
+                rznew += r[i] * zi;
+                rnorm2_new += r[i] * r[i];
             }
         }
         const double beta = rznew / rzold;
         if (use_omp) {
             #pragma omp parallel for schedule(static)
-            for (int i = 0; i < n; ++i) p[i] = r[i] + beta * p[i];
+            for (int i = 0; i < n; ++i) p[i] = z[i] + beta * p[i];
         } else {
-            for (int i = 0; i < n; ++i) p[i] = r[i] + beta * p[i];
+            for (int i = 0; i < n; ++i) p[i] = z[i] + beta * p[i];
         }
         rzold = rznew;
+        r_norm2 = rnorm2_new;
         vec_t += (now_sec() - t1);
     }
 
     free(r);
+    free(z);
     free(p);
     free(Ap);
+    free(inv_diag);
     *spmv_time_out = spmv_t;
     *vec_time_out = vec_t;
     return iter;
@@ -399,7 +441,7 @@ typedef struct {
 } RunStats;
 
 static RunStats run_variant(
-    const char* mode, int threads, int nx, const Mesh* mesh,
+    const char* mode, int threads, int nx, int graded, int use_jacobi, const Mesh* mesh,
     const double* node_x, const double* node_y, CSRMatrix* mat,
     double* rhs, double* u, int reps) {
     const int use_omp = strcmp(mode, "serial") != 0;
@@ -412,16 +454,16 @@ static RunStats run_variant(
     for (int r = 0; r <= reps; ++r) {
         const double t0 = now_sec();
         if (strcmp(mode, "serial") == 0) {
-            assemble_serial(nx, mesh, node_x, node_y, mat, rhs);
+            assemble_serial(nx, mesh, node_x, node_y, graded, mat, rhs);
         } else if (strcmp(mode, "omp_atomic") == 0) {
-            assemble_omp_atomic(nx, mesh, node_x, node_y, mat, rhs);
+            assemble_omp_atomic(nx, mesh, node_x, node_y, graded, mat, rhs);
         } else {
-            assemble_omp_colored(nx, mesh, node_x, node_y, mat, rhs);
+            assemble_omp_colored(nx, mesh, node_x, node_y, graded, mat, rhs);
         }
         const double t1 = now_sec();
 
         double spmv_s = 0.0, vec_s = 0.0;
-        const int iters = cg_solve(mat, rhs, u, use_omp, nx * 8, 1e-10, &spmv_s, &vec_s);
+        const int iters = cg_solve(mat, rhs, u, use_omp, use_jacobi, nx * 12, 1e-10, &spmv_s, &vec_s);
         const double t2 = now_sec();
         if (r == 0) continue;  // untimed warmup
 
@@ -439,57 +481,58 @@ static RunStats run_variant(
 }
 
 static int run_tests(void) {
-    // 1. Verify O(h^2) convergence: doubling nx shrinks L2 error by ~4x.
-    double errs[2] = {0.0, 0.0};
     const int sizes[2] = {32, 64};
-    for (int s = 0; s < 2; ++s) {
-        const int nx = sizes[s];
-        Mesh mesh;
-        double *node_x, *node_y;
-        CSRMatrix mat;
-        build_mesh(nx, &mesh, &node_x, &node_y);
-        build_csr_pattern(nx, &mat);
-        double* rhs = (double*)malloc((size_t)mat.n_dof * sizeof(double));
-        double* u_ser = (double*)malloc((size_t)mat.n_dof * sizeof(double));
-        double* u_atm = (double*)malloc((size_t)mat.n_dof * sizeof(double));
-        double* u_col = (double*)malloc((size_t)mat.n_dof * sizeof(double));
+    for (int graded = 0; graded <= 1; ++graded) {
+        double errs[2] = {0.0, 0.0};
+        for (int s = 0; s < 2; ++s) {
+            const int nx = sizes[s];
+            Mesh mesh;
+            double *node_x, *node_y;
+            CSRMatrix mat;
+            build_mesh(nx, &mesh, &node_x, &node_y);
+            build_csr_pattern(nx, &mat);
+            double* rhs = (double*)malloc((size_t)mat.n_dof * sizeof(double));
+            double* u_ser = (double*)malloc((size_t)mat.n_dof * sizeof(double));
+            double* u_atm = (double*)malloc((size_t)mat.n_dof * sizeof(double));
+            double* u_col = (double*)malloc((size_t)mat.n_dof * sizeof(double));
 
-        RunStats rs = run_variant("serial", 1, nx, &mesh, node_x, node_y, &mat, rhs, u_ser, 1);
-        RunStats ra = run_variant("omp_atomic", 4, nx, &mesh, node_x, node_y, &mat, rhs, u_atm, 1);
-        RunStats rc = run_variant("omp_colored", 4, nx, &mesh, node_x, node_y, &mat, rhs, u_col, 1);
-        errs[s] = rs.l2_err;
+            RunStats rs = run_variant("serial", 1, nx, graded, graded, &mesh, node_x, node_y, &mat, rhs, u_ser, 1);
+            RunStats ra = run_variant("omp_atomic", 4, nx, graded, graded, &mesh, node_x, node_y, &mat, rhs, u_atm, 1);
+            RunStats rc = run_variant("omp_colored", 4, nx, graded, graded, &mesh, node_x, node_y, &mat, rhs, u_col, 1);
+            errs[s] = rs.l2_err;
 
-        double max_diff_a = 0.0, max_diff_c = 0.0;
-        for (int i = 0; i < mat.n_dof; ++i) {
-            double da = fabs(u_atm[i] - u_ser[i]);
-            double dc = fabs(u_col[i] - u_ser[i]);
-            if (da > max_diff_a) max_diff_a = da;
-            if (dc > max_diff_c) max_diff_c = dc;
+            double max_diff_a = 0.0, max_diff_c = 0.0;
+            for (int i = 0; i < mat.n_dof; ++i) {
+                double da = fabs(u_atm[i] - u_ser[i]);
+                double dc = fabs(u_col[i] - u_ser[i]);
+                if (da > max_diff_a) max_diff_a = da;
+                if (dc > max_diff_c) max_diff_c = dc;
+            }
+            printf("graded=%d nx=%d dof=%d nnz=%d L2=%.3e iters=%d diff_atomic=%.2e diff_colored=%.2e\n",
+                   graded, nx, mat.n_dof, mat.nnz, rs.l2_err, rs.iters, max_diff_a, max_diff_c);
+            if (max_diff_a > 1e-8 || max_diff_c > 1e-8 || fabs(ra.l2_err - rs.l2_err) > 1e-8 ||
+                fabs(rc.l2_err - rs.l2_err) > 1e-8) {
+                fprintf(stderr, "FAIL: parallel solution diverged from serial\n");
+                return 1;
+            }
+            free(rhs);
+            free(u_ser);
+            free(u_atm);
+            free(u_col);
+            free(mat.row_ptr);
+            free(mat.col_idx);
+            free(mat.val);
+            free(mesh.conn);
+            free(mesh.color_elems);
+            free(node_x);
+            free(node_y);
         }
-        printf("nx=%d dof=%d nnz=%d L2=%.3e iters=%d diff_atomic=%.2e diff_colored=%.2e\n",
-               nx, mat.n_dof, mat.nnz, rs.l2_err, rs.iters, max_diff_a, max_diff_c);
-        if (max_diff_a > 1e-8 || max_diff_c > 1e-8 || fabs(ra.l2_err - rs.l2_err) > 1e-8 ||
-            fabs(rc.l2_err - rs.l2_err) > 1e-8) {
-            fprintf(stderr, "FAIL: parallel solution diverged from serial\n");
+        const double ratio = errs[0] / errs[1];
+        printf("graded=%d O(h^2) convergence ratio (nx=32 -> 64): %.2fx\n", graded, ratio);
+        if (ratio < 3.7 || ratio > 4.3) {
+            fprintf(stderr, "FAIL: expected ~4.0x L2 error reduction, got %.2fx\n", ratio);
             return 1;
         }
-        free(rhs);
-        free(u_ser);
-        free(u_atm);
-        free(u_col);
-        free(mat.row_ptr);
-        free(mat.col_idx);
-        free(mat.val);
-        free(mesh.conn);
-        free(mesh.color_elems);
-        free(node_x);
-        free(node_y);
-    }
-    const double ratio = errs[0] / errs[1];
-    printf("O(h^2) convergence ratio (nx=32 -> 64): %.2fx\n", ratio);
-    if (ratio < 3.7 || ratio > 4.3) {
-        fprintf(stderr, "FAIL: expected ~4.0x L2 error reduction, got %.2fx\n", ratio);
-        return 1;
     }
     printf("ALL TESTS PASSED\n");
     return 0;
@@ -499,12 +542,16 @@ int main(int argc, char** argv) {
     int nx = 400;
     int reps = 3;
     int csv = 0;
+    int graded = 0;
+    int use_jacobi = 0;
     const char* export_path = NULL;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--test") == 0) return run_tests();
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) nx = atoi(argv[++i]);
         if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) reps = atoi(argv[++i]);
         if (strcmp(argv[i], "--csv") == 0) csv = 1;
+        if (strcmp(argv[i], "--graded") == 0) graded = 1;
+        if (strcmp(argv[i], "--precond") == 0) use_jacobi = 1;
         if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) export_path = argv[++i];
     }
 
@@ -521,7 +568,7 @@ int main(int argc, char** argv) {
     const double bytes_per_spmv = 12.0 * (double)mat.nnz + 16.0 * (double)mat.n_dof;
 
     if (export_path) {
-        assemble_serial(nx, &mesh, node_x, node_y, &mat, rhs);
+        assemble_serial(nx, &mesh, node_x, node_y, graded, &mat, rhs);
         FILE* f = fopen(export_path, "wb");
         if (!f) { perror("export"); return 3; }
         fwrite("CSR1", 1, 4, f);
@@ -532,7 +579,7 @@ int main(int argc, char** argv) {
         fwrite(mat.val, sizeof(double), (size_t)mat.nnz, f);
         fwrite(rhs, sizeof(double), (size_t)mat.n_dof, f);
         fclose(f);
-        printf("exported %s: n_dof=%d nnz=%d\n", export_path, mat.n_dof, mat.nnz);
+        printf("exported %s: n_dof=%d nnz=%d graded=%d\n", export_path, mat.n_dof, mat.nnz, graded);
         return 0;
     }
 
@@ -540,7 +587,7 @@ int main(int argc, char** argv) {
         printf("mode,threads,nx,dof,nnz,iters,total_s,asm_s,spmv_s,vec_s,spmv_gbps,l2_err\n");
     }
 
-    RunStats base = run_variant("serial", 1, nx, &mesh, node_x, node_y, &mat, rhs, u_ref, reps);
+    RunStats base = run_variant("serial", 1, nx, graded, use_jacobi, &mesh, node_x, node_y, &mat, rhs, u_ref, reps);
     if (csv) {
         const double gbps = (bytes_per_spmv * (double)base.iters / base.spmv_s) / 1e9;
         printf("serial,1,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.2f,%.4e\n",
@@ -555,7 +602,7 @@ int main(int argc, char** argv) {
         const char* modes[] = {"omp_atomic", "omp_colored"};
         for (int mi = 0; mi < 2; ++mi) {
             if (th == 1 && mi == 0) continue;
-            RunStats st = run_variant(modes[mi], th, nx, &mesh, node_x, node_y, &mat, rhs, u, reps);
+            RunStats st = run_variant(modes[mi], th, nx, graded, use_jacobi, &mesh, node_x, node_y, &mat, rhs, u, reps);
             double max_diff = 0.0;
             for (int i = 0; i < mat.n_dof; ++i) {
                 double d = fabs(u[i] - u_ref[i]);

@@ -1,27 +1,33 @@
-# cae-parallel-solver
+# fem-diffusion-cuda
 
-2D P1 Finite Element Poisson solver (`-∇²u = f` on `[0,1]²`, `u = 0` on `∂Ω`) in C11 + OpenMP,
-built to answer one CAE performance engineering question: **where does solver time go, and why do
-more threads stop helping once the sparse matrix leaves L3 cache?**
+> **Why I wrote this:** My grad work started in COMSOL multiphysics simulation (PEM water
+> electrolysis), where everyone assumes element matrix assembly is expensive because element loops
+> look ugly. Before tuning anything by gut feel, I wrote a standalone 2D P1 FEM diffusion solver in C
+> and CUDA to break down every millisecond—and see where assembly, SpMV, host synchronization, and
+> preconditioning actually move the needle.
 
 ![2D P1 FEM Solver: L3-Resident vs DRAM-Bound Breakdown](docs/fem_breakdown.svg)
 
 ## What is inside
 
-- **Unstructured CSR assembly from triangular P1 elements**: computes exact `3×3` local stiffness
-  matrices and 3-point edge-midpoint load vectors over `2·nx²` triangles and scatters into CSR.
-- **Three execution modes over identical CSR sparsity**:
-  - `serial` — single-threaded assembly + Conjugate Gradient (`tol = 1e-10`)
+- **Unstructured CSR assembly from triangular P1 elements**: solves `-∇·(k(x)∇u) = f` on `[0,1]²`
+  (`u = 0` on `∂Ω`) for both uniform (`k=1`) and graded conductivity (`--graded`, `k(x) = 1 + 49x²`,
+  a 50× material contrast mimicking porous-layer conductivity gradients).
+- **Three CPU modes over identical CSR sparsity**:
+  - `serial` — single-threaded assembly + (P)CG (`tol = 1e-10`)
   - `omp_atomic` — OpenMP element loop protected by `#pragma omp atomic`
   - `omp_colored` — **8-color lock-free element batching** (zero shared vertices within any color,
-    zero atomics, bit-identical CG convergence to `~2e-15` of serial)
-- **Verification before timing**: `make test` checks `O(h²)` spatial convergence (`4.00×` L2 error
-  drop when doubling `nx: 32 → 64`) and verifies `||u_omp - u_serial||_∞ < 1e-8`.
+    zero atomics, bit-identical CG convergence to `< 8.6e-15` of serial)
+- **Jacobi preconditioned CG (`--precond`)**: cuts iterations by **2.96×** when conductivity varies 50×.
+- **Two GPU CG implementations** over the exact CPU-assembled CSR (`--export`):
+  - `src/spmv_cuda.cu`: `scalar` / `two_rows` / `warp` CSR SpMV kernels
+  - `src/cg_cuda.cu` (v1): 3 host-synchronized dot products per iteration
+  - `src/cg_cuda_dev.cu` (v2): reductions and `alpha`/`beta` kept on device (`--sync-every 20`)
+- **Verification before timing**: `make test` checks `4.00×` `O(h²)` spatial convergence on both
+  uniform and graded cases and asserts `||u_omp - u_serial||_∞ < 1e-8`.
 
-## Results
+## CPU Results (`i7-14650HX`, 6 physical cores / 12 threads, gcc 16.2.0)
 
-Machine: WSL2 Ubuntu 24.04, `Intel Core i7-14650HX` (**6 physical cores / 12 threads**), gcc 16.2.0
-(`-O3 -march=native -fopenmp`). Best of 5 (`nx=400`) or 3 (`nx=800`) timed runs after an untimed warmup.
 Effective CSR SpMV bandwidth uses compulsory traffic `(12·nnz + 16·dof)` bytes per iteration.
 
 ### 1. Cache-resident mesh (`nx = 400`, `159,201` DOFs, `1,111,217` NNZ, ~16 MB, 571 CG iters, `L2 = 2.614e-6`)
@@ -46,77 +52,55 @@ Effective CSR SpMV bandwidth uses compulsory traffic `(12·nnz + 16·dof)` bytes
 | `omp_atomic` | 12 | 1.475 | 3.21× | 20.05 | 1.148 | 0.306 | 61.0 GB/s |
 | `omp_colored` | 12 | **1.452** | **3.26×** | **15.92 (4.18×)** | **1.132** | **0.303** | **61.9 GB/s** |
 
-## GPU: same matrix, different schedule
+### 3. When material conductivity varies 50× (`k(x) = 1 + 49x²`, `nx = 400`, 12 threads)
 
-`fem_solver -n <nx> --export build/m<nx>.csr` writes the assembled CSR, and `src/cg_cuda_dev.cu` solves the
-same system on the GPU. Two GPU versions exist because the first one had a lesson in it.
+| solver | iterations | total (ms) | SpMV (ms) | L2 error |
+| --- | --- | --- | --- | --- |
+| Unpreconditioned CG (`--graded`) | 3,136 | 453.1 | 308.9 | `3.115e-06` |
+| **Jacobi Preconditioned CG (`--graded --precond`)** | **1,061 (2.96× fewer)** | **167.7 (2.70× faster)** | **108.9** | `3.115e-06` |
 
-| case | iters | CPU 12 threads | GPU v1: host syncs | GPU v2: device loop | v2 vs CPU |
+## GPU Results (`RTX 5070 Ti Laptop, sm_120, CUDA 13.5`)
+
+![CG solve time: host round trips vs device-resident loop](docs/gpu_cg.svg)
+
+`fem_solver -n <nx> --export build/m<nx>.csr` writes the assembled CSR, and both GPU CG binaries solve
+the exact same matrix:
+
+| case | iters | CPU 12 threads | GPU v1 (`cg_cuda`, host syncs) | GPU v2 (`cg_cuda_dev`, device loop) | v2 vs CPU |
 | --- | --- | --- | --- | --- | --- |
 | nx=400, 159k DOF | 571 / 580 | 65 ms | 147 ms (**0.44×**) | **56 ms** | **1.15×** |
 | nx=800, 638k DOF | 1098 / 1100 | 962 ms | 465 ms (2.07×) | **331 ms** | **2.91×** |
 
-Both GPU versions converge to the same solution as the CPU run (`sum(x) = 64844.557535290` at 159k,
-`259381.230124981` at 638k; relative residual 7.5e-11 and 2.2e-10).
+Both GPU versions converge to the same solution as CPU (`sum(x) = 64844.557535290` at 159k,
+`259381.230124981` at 638k; relative residual `7.5e-11` and `2.2e-10`).
 
-- **v1** synchronised with the host three times per iteration: three dot products, each a device→host copy.
-  At 159k DOF one SpMV is only 19 µs, so those round trips were ~93% of the iteration — the GPU lost to a
-  12-thread CPU.
-- **v2** keeps the reductions and the scalars `alpha` / `beta` on the device. The two dots needed per
-  iteration are reduced in place, `alpha` and `beta` come from a one-thread kernel, and the `axpy` / `axpby`
-  kernels read their scalar from device memory. The only host read left is the residual check.
-- **The maths never changed.** Same matrix, same tolerance, same iteration count. The schedule changed, and
-  the small case went from 0.44× to 1.15×.
+- **Why v1 lost at 159k DOF:** One SpMV takes ~19 µs; three host-synced dot products per iteration
+  accounted for ~93% of step time. Keeping `alpha`/`beta` and reductions on device flipped 0.44× to 1.15×.
+- **How often to check convergence (`sync_every`):** Checking every iteration takes 77 ms (`571` iters);
+  every 20 takes **56 ms (`580` iters)**; every 50 overshoots to 600 iters (65 ms).
+- **Burst vs sustained laptop GPU bandwidth:** SpMV runs at **392.9 GB/s** (matching measured device
+  copy bandwidth 392.3 GB/s) over 30 reps, `354.4 GB/s` over 1,098 reps, and **`192.8 GB/s`** over 3,000 reps.
 
-**How often to check convergence** (159k DOF, tolerance 1e-10):
+## Four takeaways for CAE engineering
 
-| residual check every | iterations | solve time | ms/iter |
-| --- | --- | --- | --- |
-| 1 | 571 | 77 ms | 0.136 |
-| 5 | 575 | 61 ms | 0.106 |
-| **20** | 580 | **56 ms** | **0.097** |
-| 50 | 600 | 65 ms | 0.109 |
-| 100 | 600 | 58 ms | 0.097 |
-
-Checking every iteration costs 37% more than every 20; checking every 50 overshoots to 600 iterations.
-The sweet spot is a property of the machine and the matrix, which is why it is a flag (`sync_every`).
-
-**Burst is not sustained.** The same SpMV kernel, same matrix, measured at three repetition counts:
-
-| repetitions | ms per SpMV | GB/s |
-| --- | --- | --- |
-| 30 | 0.162 | 392.9 |
-| 1,098 | 0.180 | 354.4 |
-| 3,000 | 0.331 | **192.8** |
-
-A laptop GPU does not hold its burst bandwidth. Every number in this README states its run length for that
-reason.
-
-Reproduce: `make gpu-bench` (kernels) and `make cg-both` (both CG versions).
-
-## Three takeaways for CAE performance engineering
-
-1. **Why optimize SpMV before assembly:** On `nx=800` at 12 threads, CSR assembly takes **1.1%**
-   (`15.9 ms`) of wall time, whereas CSR SpMV (**77.9%**, `1.132 s`) and CG vector ops (**20.9%**,
-   `0.303 s`) consume **98.8%**.
-2. **Graph coloring beats atomics by ~21–25% on assembly, without changing solver math:**
-   `omp_colored` cuts assembly from `5.19 → 3.89 ms` (`nx=400`) and `20.05 → 15.92 ms` (`nx=800`)
-   while maintaining `O(h²)` accuracy (`4.00×` L2 drop from `nx=400` to `800`) and `~2e-15` agreement.
-3. **Crossing L3 exposes the exact DRAM wall from `hpc-kernels`:** At `nx=400` (~16 MB), SpMV
-   scales inside L3 to **157.8 GB/s** (`5.92×` total speedup). At `nx=800` (~64 MB), SpMV flattens
-   at **56.8 → 61.9 GB/s** from 4 to 12 threads — matching the **58.35 GB/s** `axpy` DRAM ceiling
-   measured independently in [hpc-kernels](https://github.com/cccjj55/hpc-kernels). Beyond 4 threads,
-   adding cores yields <15% total gain; cutting CG iterations (preconditioning / multigrid) or moving
-   matrix-free is what actually moves the needle.
+1. **Measure before optimizing assembly:** At `nx=800` (12 threads), assembly is **1.1%** (`15.9 ms`)
+   while SpMV (`77.9%`) + vector ops (`20.9%`) consume **98.8%**.
+2. **8-color batching beats `#pragma omp atomic` by 21%–25% on assembly** with identical solver convergence.
+3. **Crossing L3 exposes the exact DRAM wall from [cuda-omp-roofline](https://github.com/cccjj55/cuda-omp-roofline):**
+   CPU SpMV drops from `157.8 GB/s` (in L3) to `56.8–61.9 GB/s` (DRAM, matching CPU `axpy` `58.35 GB/s`);
+   GPU SpMV saturates at `392.9 GB/s` (matching GPU copy `392.3 GB/s`).
+4. **Once SpMV hits the memory wall, only preconditioning cuts wall time further:** Jacobi PCG drops
+   a 50× conductivity-gradient solve from `453 ms → 168 ms` without touching a single kernel instruction.
 
 ## Build and run
 
 ```bash
 make build
-make test                           # O(h^2) convergence + OpenMP equivalence check
+make test                                              # uniform + graded O(h^2) convergence checks
 ./build/fem_solver -n 400 -r 5 --csv > results/fem_400.csv
-./build/fem_solver -n 800 -r 3 --csv > results/fem_800.csv
-python3 scripts/plot_svg.py results/fem_400.csv results/fem_800.csv docs/fem_breakdown.svg
+./build/fem_solver -n 400 -r 3 --graded --precond      # heterogeneous diffusivity + Jacobi PCG
+make gpu-bench                                         # CUDA SpMV kernels on exported CSR
+make cg-both                                           # runs both GPU v1 (cg_cuda) and v2 (cg_cuda_dev)
 ```
 
 ## License
